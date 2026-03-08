@@ -1,0 +1,222 @@
+trigger:
+ - master
+
+pool: tanishka-pool
+
+variables:
+  env: dev
+  workDir: '$(System.DefaultWorkingDirectory)/environments/$(env)'
+  awsServiceConnection: 'aws-infra-sc'
+
+stages:
+
+# ==============================
+# STAGE: Code Quality & Security
+# ==============================
+
+- stage: CodeQualityAndSecurity
+  displayName: Code Quality and Security Validation
+
+  jobs:
+
+  - job: TerraformSyntaxValidation
+    displayName: Terraform Format and Validation
+
+    steps:
+
+    - task: TerraformInstaller@1
+      displayName: Install Terraform
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        terraform init \
+        -backend-config="bucket=terraform-ondc-state" \
+        -backend-config="key=$(env)/terraform.tfstate" \
+        -backend-config="region=ap-south-1" \
+        -backend-config="dynamodb_table=terraform-lock-table"
+      workingDirectory: $(workDir)
+      displayName: Terraform Init
+
+    - script: terraform validate
+      workingDirectory: $(workDir)
+      displayName: Terraform Validate
+
+    - script: terraform fmt -check
+      workingDirectory: $(workDir)
+      displayName: Terraform Format Check
+
+  # ==============================
+  # TFSEC
+  # ==============================
+
+  - job: TfsecScan
+    displayName: Tfsec Security Scan
+
+    steps:
+
+    - script: |
+        tfsec . --format json --out tfsec-report.json
+      workingDirectory: $(workDir)
+      displayName: Run tfsec
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workDir)/tfsec-report.json'
+        artifact: 'tfsec-report'
+
+  # ==============================
+  # TRIVY
+  # ==============================
+
+  - job: TrivyScan
+    displayName: Trivy Vulnerability Scan
+
+    steps:
+
+    - script: |
+        trivy fs --severity MEDIUM,HIGH,CRITICAL $(workDir)
+      displayName: Run Trivy Scan
+
+  # ==============================
+  # TFLINT
+  # ==============================
+
+  - job: TflintScan
+    displayName: TFLint Static Analysis
+
+    steps:
+
+    - script: |
+        tflint --init
+        tflint
+      workingDirectory: $(workDir)
+      displayName: Run TFLint
+
+  # ==============================
+  # CHECKOV
+  # ==============================
+
+  - job: CheckovScan
+    displayName: Checkov Policy Compliance Scan
+
+    steps:
+
+    - script: |
+        checkov -d .
+      workingDirectory: $(workDir)
+      displayName: Run Checkov
+
+# ==============================
+# STAGE: Cost Estimation
+# ==============================
+
+- stage: CostEstimation
+  displayName: Infrastructure Cost Estimation
+
+  jobs:
+
+  - job: InfracostAnalysis
+
+    steps:
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        terraform init \
+        -backend-config="bucket=terraform-ondc-state" \
+        -backend-config="key=$(env)/terraform.tfstate" \
+        -backend-config="region=ap-south-1" \
+        -backend-config="dynamodb_table=terraform-lock-table"
+      workingDirectory: $(workDir)
+
+    - script: terraform plan -out tfplan
+      workingDirectory: $(workDir)
+
+    - script: |
+        infracost breakdown --path tfplan --out-file infracost.json
+      workingDirectory: $(workDir)
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(workDir)/infracost.json'
+        artifact: 'infracost-report'
+
+# ==============================
+# STAGE: Terraform Plan
+# ==============================
+
+- stage: TerraformPlan
+  displayName: Terraform Plan Review
+
+  jobs:
+
+  - job: TerraformPlanJob
+
+    steps:
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        terraform init \
+        -backend-config="bucket=terraform-ondc-state" \
+        -backend-config="key=$(env)/terraform.tfstate" \
+        -backend-config="region=ap-south-1" \
+        -backend-config="dynamodb_table=terraform-lock-table"
+      workingDirectory: $(workDir)
+
+    - script: terraform plan
+      workingDirectory: $(workDir)
+
+# ==============================
+# STAGE: Manual Approval
+# ==============================
+
+- stage: ManualApproval
+  displayName: Manual Approval Gate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+
+  jobs:
+
+  - job: ManualApprovalJob
+    pool: server
+
+    steps:
+
+    - task: ManualValidation@1
+      inputs:
+        notifyUsers: 'ertanishka2024@gmail.com'
+        approvers: 'ertanishka2024@gmail.com'
+        instructions: 'Please review Terraform plan before approval.'
+
+# ==============================
+# STAGE: Deployment
+# ==============================
+
+- stage: Deployment
+  displayName: Terraform Deployment
+
+  jobs:
+
+  - job: TerraformApplyJob
+
+    steps:
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: 'latest'
+
+    - script: |
+        terraform init \
+        -backend-config="bucket=terraform-ondc-state" \
+        -backend-config="key=$(env)/terraform.tfstate" \
+        -backend-config="region=ap-south-1" \
+        -backend-config="dynamodb_table=terraform-lock-table"
+      workingDirectory: $(workDir)
+
+    - script: terraform apply -auto-approve
+      workingDirectory: $(workDir)
